@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "clickpoints"
-version = "1.10.0"
+version = "1.10.1"
 description = "Scientific toolbox for manual and automatic image evaluation."
 authors = ["Richard Gerum <richard.gerum@fau.de>", "Sebastian Richter <57496278+foxsr@users.noreply.github.com>"]
 maintainers = ["Alexander Winterl <alexander.winterl@fau.de>"]
@@ -10,36 +10,38 @@ license = "GPLv3"
 readme = "README.rst"
 
 [tool.poetry.dependencies]
-python = ">=3.10,<3.14"
-matplotlib = "*"
-imageio = ">=2.0.1"
-QtPy = "*"
-QtAwesome = "*"
-qimage2ndarray = "*"
-Pillow = "*"
-peewee = ">= 3.1"
-natsort = "*"
+python = ">=3.12,<3.14"
+matplotlib = ">=3.8"
+imageio = ">=2.34"
+PyQt5 = ">=5.15"
+QtPy = ">=2.4"
+QtAwesome = ">=1.4"
+qimage2ndarray = ">=1.10"
+Pillow = ">=10.3"
+peewee = ">=3.18"
+natsort = ">=8.4"
 tifffile = ">=2020.2.16"
-imagecodecs = "*"
-sortedcontainers = "*"
-psutil = "*"
-imageio-ffmpeg = "*"
-qasync = "*"
+imagecodecs = ">=2025.3"
+sortedcontainers = "^2.4" 
+psutil = ">=5.9"
+imageio-ffmpeg = ">=0.6"
+qasync = ">=0.27"
 python-dateutil = ">=2.8.1"
-scikit-image = ">=0.14"
+scikit-image = ">=0.25"
 sphinx-rtd-theme = { version = "^1.1.1", optional = true }
 sphinxcontrib-bibtex = { version = "^2.5.0", optional = true }
 sphinxcontrib-svg2pdfconverter = { version = "^1.2.1", optional = true }
 nbsphinx = { version = "^0.8.9", optional = true }
 mock = { version = "^4.0.3", optional = true }
-scipy = "^1.15.2"
+scipy = ">=1.11,<2.0"
+numpy = ">=1.26"
 opencv-python = "^4.11.0.86"
 pyside6 = "^6.8.2.1"
 
 
 [tool.poetry.extras]
 docs = ["sphinx-rtd-theme", "sphinxcontrib-bibtex", "sphinxcontrib-svg2pdfconverter", "nbsphinx", "mock"]
-
+video = ["av"]
 
 [tool.poetry.scripts]
 clickpoints = "clickpoints.launch:main"

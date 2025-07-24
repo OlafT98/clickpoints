@@ -1603,7 +1603,34 @@ class DataFile:
                                 "one image bigger than the allowed memory size.\n"
                                 "The buffer should be only as big as the\n"
                                 "RAM has space to prevent swapping.")
+        # ---- Bidirectional preloading ----
+        self._last_category = "Buffer"
+        self._AddOption(
+            key="bidirectional_preloading",
+            display_name="Bidirectional Preloading",
+            default=False,
+            value_type="bool",
+            tooltip="If enabled, ClickPoints preloads N frames before and after the current frame.\n"
+                    "For videos, whole GOPs around the current frame are preloaded."
+        )
+        self._AddOption(
+            key="preload_radius",
+            display_name="Preload radius (frames)",
+            default=30,
+            value_type="int",
+            min_value=1,
+            tooltip="How many frames to preload on each side when bidirectional preloading is enabled."
+        )
+        self._AddOption(
+            key="preload_default_gop",
+            display_name="Default GOP size (video)",
+            default=60,
+            value_type="int",
+            min_value=1,
+            tooltip="Fallback GOP size if it cannot be detected from the video file."
+        )
 
+	
         self._last_category = "Script Launcher"
         self._AddOption(key="scripts", hidden=True, default=[], value_type="array")
 
@@ -1714,6 +1741,7 @@ class DataFile:
         self._AddOption(key="sql_port", default=3306, value_type="int", hidden=True)
         self._AddOption(key="sql_user", default='', value_type="string", hidden=True)
         self._AddOption(key="sql_pwd", default='', value_type="string", hidden=True)
+        
 
     def _AddOption(self, **kwargs):
         category = kwargs["category"] if "category" in kwargs else self._last_category

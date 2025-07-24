@@ -37,6 +37,7 @@ from qtpy import QtGui
 
 from clickpoints.DataFile import DataFile
 from clickpoints.includes.ConfigLoad import dotdict
+from typing import Iterable, Tuple
 
 # remove decompression bomb warning which is now an exception
 PIL.Image.MAX_IMAGE_PIXELS = None
@@ -834,6 +835,106 @@ class DataFileExtended(DataFile):
                             return None
             except ValueError:  # invalid tiff file
                 return None
+                
+        
+    def ensure_frames_buffered(self, indices: Iterable[int], layer):
+        """Load frames into buffer if missing (ignores normal buffer limits)."""
+        for idx in indices:
+            if idx < 0 or idx >= self.get_image_count():
+                continue
+            if self.buffer.get_frame(idx, layer) is not None:
+                continue
+            image_obj = self.table_image.get(sort_index=idx, layer_id=layer.id)
+            slots, slot_index = self.buffer.prepare_slot(idx, layer)
+            self.buffer_frame(image_obj, image_obj.get_full_filename(), slots, slot_index, idx, layer=layer)
+
+    def _is_video_image(self, image_obj) -> bool:
+        fn = image_obj.filename.lower()
+        return fn.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm"))
+
+    def _get_gop_bounds(self, frame_index: int, image_obj, default_gop: int) -> Tuple[int, int]:
+        """
+        Return (start, end) indices (inclusive) of the GOP containing frame_index.
+        Try to detect keyframes via imageio metadata; fallback to default_gop.
+        """
+        # simple cache on the DataFileExtended instance
+        if not hasattr(self, "_gop_cache"):
+            self._gop_cache = {}  # {filename: {"keys":[...], "gop_size":int}}
+
+        fn = image_obj.get_full_filename()
+        cache = self._gop_cache.get(fn)
+        if cache is None:
+            keys = []
+            gop_size = default_gop
+            try:
+                rdr = imageio.get_reader(fn)
+                md = rdr.get_meta_data()
+                # some backends expose 'key_frames'
+                keys = md.get("key_frames", []) or md.get("keyframes", [])
+                if not keys and "codec" in md:
+                    # no real data; keep default
+                    pass
+                if keys:
+                    # derive variable GOP, but we still preload full blocks around current
+                    pass
+            except Exception:
+                pass
+            cache = {"keys": keys, "gop_size": gop_size}
+            self._gop_cache[fn] = cache
+
+        keys = cache["keys"]
+        gop_size = cache["gop_size"]
+
+        if keys:
+            # find last key <= frame_index
+            import bisect
+            i = bisect.bisect_right(keys, frame_index) - 1
+            start = keys[i] if i >= 0 else 0
+            # next key - 1 or end of video
+            end = keys[i + 1] - 1 if i + 1 < len(keys) else self.get_image_count() - 1
+            return start, end
+        else:
+            # fixed-size GOP fallback
+            start = (frame_index // gop_size) * gop_size
+            end = min(start + gop_size - 1, self.get_image_count() - 1)
+            return start, end
+
+    def preload_bidirectional(self, center: int, layer, n: int, default_gop: int):
+        """Preload +/- n frames for images, or whole GOPs for videos."""
+        if center is None:
+            return
+        # get current image object
+        img = self.table_image.get(sort_index=center, layer_id=layer.id)
+
+        if self._is_video_image(img):
+            # preload previous, current, next GOPs around center (enough to cover +/- n)
+            cur_start, cur_end = self._get_gop_bounds(center, img, default_gop)
+            ranges = [(cur_start, cur_end)]
+
+            # previous needed?
+            if center - n < cur_start:
+                prev_start = max(cur_start - default_gop, 0)
+                # if we have keys, recompute
+                ps, pe = self._get_gop_bounds(prev_start, img, default_gop)
+                ranges.append((ps, pe))
+
+            # next needed?
+            if center + n > cur_end:
+                ns = cur_end + 1
+                if ns < self.get_image_count():
+                    ns, ne = self._get_gop_bounds(ns, img, default_gop)
+                    ranges.append((ns, ne))
+
+            frames = []
+            for s, e in ranges:
+                frames.extend(range(s, e + 1))
+        else:
+            # still images
+            start = max(center - n, 0)
+            end = min(center + n, self.get_image_count() - 1)
+            frames = range(start, end + 1)
+
+        self.ensure_frames_buffered(frames, layer)
 
 
 class FrameBuffer:

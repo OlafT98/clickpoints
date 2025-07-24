@@ -865,7 +865,6 @@ class Timeline(QtCore.QObject):
 
     fps = 25
     skip = 1  # where skip should be called step width i.e step=10 -> frame0 to frame10
-
     subsecond_decimals = 0
 
     def __init__(self, window: "ClickPointsWindow", layout: QtWidgets.QLayout,
@@ -877,6 +876,13 @@ class Timeline(QtCore.QObject):
 
         self.images_added_signal.connect(self.ImagesAddedMain)
 
+        # playback state
+        self.running = False
+        self.playing = False
+        self.current_fps = 0
+        self.last_time = time.time()
+
+        # toggle button (show/hide timeline UI)
         self.button = QtWidgets.QPushButton()
         self.button.setCheckable(True)
         self.button.setIcon(qta.icon("fa5s.play"))
@@ -893,12 +899,11 @@ class Timeline(QtCore.QObject):
         self.layoutCtrl = HiddeableLayout(self.layoutCtrlParent, QtWidgets.QHBoxLayout)
         self.layoutCtrl.setContentsMargins(5, 5, 5, 0)
 
-        # second
+        # second row
         self.layoutCtrl2 = HiddeableLayout(self.layoutCtrlParent, QtWidgets.QHBoxLayout)
         self.layoutCtrl2.setContentsMargins(5, 0, 5, 0)
         self.timeSlider = RealTimeSlider()
         self.layoutCtrl2.addWidget(self.timeSlider)
-        # self.timeSlider.setTimes(self.data_file)
         empty_space_keeper = QtWidgets.QLabel()
         empty_space_keeper.setMaximumHeight(0)
         empty_space_keeper.setMaximumWidth(0)
@@ -906,7 +911,6 @@ class Timeline(QtCore.QObject):
 
         self.timeSlider.slider_position.signal.sliderPressed.connect(self.PressedSlider)
         self.timeSlider.slider_position.signal.sliderReleased.connect(self.ReleasedSlider2)
-
         self.timeSlider.setToolTip("current time stamp")
 
         self.layoutCtrl3 = HiddeableLayout(layout, QtWidgets.QHBoxLayout)
@@ -931,14 +935,11 @@ class Timeline(QtCore.QObject):
         self.layoutCtrl.addWidget(self.label_frame)
 
         self.frameSlider = TimeLineSlider(scale=self.window.scale_factor)
-        # if self.get_frame_count():
-        #    self.frameSlider.setRange(0, self.get_frame_count() - 1)
         self.frameSlider.slider_position.signal.sliderPressed.connect(self.PressedSlider)
         self.frameSlider.slider_position.signal.sliderReleased.connect(self.ReleasedSlider)
         self.frameSlider.start_changed.connect(lambda value: self.data_file.setOption("play_start", value))
         self.frameSlider.end_changed.connect(lambda value: self.data_file.setOption("play_end", value))
         self.frameSlider.setToolTip("current frame, drag to change current frame\n[b], [n] to set start/end marker")
-        # self.frameSlider.setValue(self.get_frame_count())
         self.slider_update = True
         self.layoutCtrl.addWidget(self.frameSlider)
 
@@ -958,75 +959,56 @@ class Timeline(QtCore.QObject):
         self.spinBox_Skip.setToolTip("display every Nth frame")
         self.layoutCtrl.addWidget(self.spinBox_Skip)
 
-        # video replay
-        self.current_fps = 0
-        self.last_time = time.time()
-        # initialize the frame timer
-        loop = self.window.app.loop
-        asyncio.ensure_future(self.runTimer(loop), loop=loop)
+        # Qt timer for playback
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._tick)
 
         self.hidden = True
-
         self.closeDataFile()
 
-    async def runTimer(self, loop: QEventLoop):
+    # -------- Qt timer tick --------
+    def _tick(self) -> None:
+        if not self.running or self.data_file is None or self.get_current_frame() is None:
+            return
 
-        t = time.time()
-        target_fps = 25
-        self.target_delta_t = 1 / target_fps
-        last_overhead = 0
-        mean_fps = target_fps
-        averaging_decay = 0.9
+        # Advance frame respecting start/end & skip
+        if (self.get_current_frame() < self.frameSlider.startValue()
+                or self.get_current_frame() + self.skip > self.frameSlider.endValue()):
+            self.window.load_frame(self.frameSlider.startValue())
+        else:
+            self.window.load_frame(self.window.target_frame + self.skip)
 
-        while True:
-            if self.running:
-                wait = loop.create_task(asyncio.sleep(max(self.target_delta_t - last_overhead, 0)))
-                if self.data_file is None or self.get_current_frame() is None:
-                    return
-                if self.get_current_frame() < self.frameSlider.startValue() or self.get_current_frame() + self.skip > self.frameSlider.endValue():
-                    self.window.load_frame(self.frameSlider.startValue())
-                else:
-                    self.window.load_frame(self.window.target_frame + self.skip)
-                await wait
+        # FPS estimate (exponential smoothing)
+        dt = max(time.time() - self.last_time, 1e-9)
+        self.last_time = time.time()
+        if self.current_fps in (None, 0):
+            self.current_fps = 1 / dt
+        else:
+            a = 0.9
+            self.current_fps = a * self.current_fps + (1 - a) * (1 / dt)
 
-                # calculate the time slip
-                delta_t = time.time() - t
-                t = time.time()
-                last_overhead += 0.1 * (delta_t - self.target_delta_t)
-
-                mean_fps = averaging_decay * mean_fps + (1 - averaging_decay) * 1 / (delta_t + 1e-9)
-            else:
-                await asyncio.sleep(0.01)
-                t = time.time()
-
+    # -------- Public API / original methods --------
     def closeDataFile(self) -> None:
         self.data_file = None
         self.config = None
 
         self.frameSlider.clearTickMarker()
-
         self.Play(False)
-
         self.HideInterface(True)
 
-    # load Data File values
     def updateDataFile(self, data_file: DataFileExtended, new_database: bool) -> None:
         self.data_file = data_file
         self.config = data_file.getOptionAccess()
 
-        self.fps = 0
-        if self.fps == 0:
-            self.fps = 25
+        self.fps = 25 if self.fps == 0 else self.fps
         if self.config.fps != 0:
             self.fps = self.config.fps
         self.skip = self.config.skip
-
         self.spinBox_Skip.setValue(self.skip)
 
         # prepare timestamp output
-        # detect %*f marker get number form 1 to 6 as *
         self.subsecond_decimals = 0
-        regexp = re.compile('.*.%(\d)f.*')
+        regexp = re.compile(r'.*.%(\d)f.*')
         match = regexp.match(self.data_file.getOption("display_timeformat"))
         if match:
             self.subsecond_decimals = match.group(1)
@@ -1065,9 +1047,7 @@ class Timeline(QtCore.QObject):
             self.frameSlider.setEndValue(self.get_frame_count() - 1)
         self.updateLabel()
 
-        # reset start and end marker (only if all images are loaded frames may be valid)
         if self._startframe is not None:
-            # if >1 its a frame nr if < 1 its a fraction
             if self._startframe >= 1:
                 self.frameSlider.setStartValue(self._startframe)
             else:
@@ -1094,9 +1074,7 @@ class Timeline(QtCore.QObject):
         self.fps = self.spinBox_FPS.value()
         self.data_file.setOption("fps", self.fps)
         if self.playing:
-            self.target_delta_t = 1 / self.fps
-            self.running = True
-            # self.timer.start(1000 / self.fps)
+            self.timer.setInterval(int(1000 / max(self.fps, 1)))
 
     def ReleasedSlider(self) -> None:
         n = self.frameSlider.value()
@@ -1118,16 +1096,17 @@ class Timeline(QtCore.QObject):
 
     def Play(self, state: bool) -> None:
         if state:
-            self.target_delta_t = 1 / self.fps
+            self.target_delta_t = 1 / max(self.fps, 1)
             self.running = True
-            # self.timer.start(1000 / self.fps)
             self.button_play.setIcon(QtGui.QIcon(os.path.join(os.environ["CLICKPOINTS_ICON"], "pause.ico")))
             self.playing = True
+            self.timer.setInterval(int(1000 / max(self.fps, 1)))
+            self.timer.start()
         else:
             self.running = False
-            # self.timer.stop()
             self.button_play.setIcon(QtGui.QIcon(os.path.join(os.environ["CLICKPOINTS_ICON"], "play.ico")))
             self.playing = False
+            self.timer.stop()
 
     def updateFrame(self, nr: int = -1) -> None:
         if self.data_file is None or self.get_current_frame() is None:
@@ -1135,7 +1114,8 @@ class Timeline(QtCore.QObject):
         if nr != -1:
             self.window.JumpToFrame(nr)
         else:
-            if self.get_current_frame() < self.frameSlider.startValue() or self.get_current_frame() + self.skip > self.frameSlider.endValue():
+            if (self.get_current_frame() < self.frameSlider.startValue()
+                    or self.get_current_frame() + self.skip > self.frameSlider.endValue()):
                 self.window.JumpToFrame(self.frameSlider.startValue())
             else:
                 self.window.JumpFrames(self.skip)
@@ -1145,7 +1125,6 @@ class Timeline(QtCore.QObject):
             return
         if self.slider_update or 1:
             self.frameSlider.setValue(self.get_current_frame())
-
             if self.timeSlider and self.data_file.image and self.data_file.image.timestamp:
                 self.timeSlider.setValue(self.data_file.image.timestamp)
             if self.get_current_frame() is not None:
@@ -1159,18 +1138,17 @@ class Timeline(QtCore.QObject):
             else:
                 label_string = ""
             if self.data_file.image and self.data_file.image.timestamp:
-                # if subsecond decimals are specified - adjust string accordingly
                 if not self.subsecond_decimals == 0:
                     display_timeformat = self.data_file.getOption("display_timeformat").replace(
-                        '%%%sf' % self.subsecond_decimals, ('%%0%sd' % self.subsecond_decimals) % (
-                                self.data_file.image.timestamp.microsecond / 10 ** (
-                                6 - int(self.subsecond_decimals))))
+                        '%%%sf' % self.subsecond_decimals,
+                        ('%%0%sd' % self.subsecond_decimals) % (
+                            self.data_file.image.timestamp.microsecond /
+                            10 ** (6 - int(self.subsecond_decimals))))
                 label_string += "\n" + self.data_file.image.timestamp.strftime(display_timeformat)
             self.label_frame.setText(label_string)
 
     def labelClicked(self, event: QtCore.QEvent) -> None:
         self.select_frame_window = SelectFrame(self.get_current_frame(), self.get_frame_count())
-
         value = self.select_frame_window.exec_()
         if value > 0:
             self.window.JumpToFrame(value - 1)
@@ -1183,9 +1161,7 @@ class Timeline(QtCore.QObject):
         else:
             a = np.exp(-dt)
             self.current_fps = a * self.current_fps + (1 - a) * 1 / dt
-
         self.updateLabel()
-        # self.timer.allow_next() TODO
 
     def MaskAdded(self) -> None:
         self.frameSlider.addTickMarker(self.get_current_frame(), type=1)
@@ -1228,46 +1204,36 @@ class Timeline(QtCore.QObject):
         self.HideInterface(self.hidden)
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
-        # @key H: hide control elements
         if event.key() == QtCore.Qt.Key_H:
             self.HideInterface(self.hidden is False)
-        # @key Space: run/pause
         if event.key() == QtCore.Qt.Key_Space:
+        
             self.current_fps = None
             self.last_time = time.time()
             self.button_play.toggle()
 
-        # @key B: move start marker here
         if event.key() == QtCore.Qt.Key_B:
             self.frameSlider.setStartValue(self.get_current_frame())
-        # @key N: move start marker here
         if event.key() == QtCore.Qt.Key_N:
             self.frameSlider.setEndValue(self.get_current_frame())
 
-        # @key ---- Frame jumps ----
         if event.key() == QtCore.Qt.Key_Left and event.modifiers() & QtCore.Qt.ControlModifier:
-            # @key Ctrl+Left: previous annotated image
             tick = self.frameSlider.getNextTick(self.get_current_frame(), back=True)
             self.window.JumpToFrame(tick)
         if event.key() == QtCore.Qt.Key_Right and event.modifiers() & QtCore.Qt.ControlModifier:
-            # @key Ctrl+Right: next annotated image
             tick = self.frameSlider.getNextTick(self.get_current_frame())
             self.window.JumpToFrame(tick)
 
         if event.key() == QtCore.Qt.Key_Left and event.modifiers() & QtCore.Qt.AltModifier:
-            # @key Alt+Left: previous annotation block
             tick = self.frameSlider.getNextTickChange(self.get_current_frame(), back=True)
             self.window.JumpToFrame(tick)
         if event.key() == QtCore.Qt.Key_Right and event.modifiers() & QtCore.Qt.AltModifier:
-            # @key Alt+Right: next annotation block
             tick = self.frameSlider.getNextTickChange(self.get_current_frame())
             self.window.JumpToFrame(tick)
 
         if event.key() == QtCore.Qt.Key_Home and event.modifiers() & QtCore.Qt.ControlModifier:
-            # @key Ctrl+Home: jump to start marker
             self.window.JumpToFrame(self.frameSlider.startValue())
         if event.key() == QtCore.Qt.Key_End and event.modifiers() & QtCore.Qt.ControlModifier:
-            # @key Ctrl+End: jump to end marker
             self.window.JumpToFrame(self.frameSlider.endValue())
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
@@ -1276,3 +1242,4 @@ class Timeline(QtCore.QObject):
     @staticmethod
     def file() -> str:
         return __file__
+
