@@ -308,18 +308,38 @@ class OptionEditorWindow(QtWidgets.QWidget):
                 edit.has_error = False
                 self.edits.append(edit)
                 self.edits_by_name[option.key] = edit
+                if option.key == "preload_gops":
+                    warning = QtWidgets.QLabel("Warning, GOP couldn't be detected, use image mode instead")
+                    warning.setStyleSheet("color: orange")
+                    warning.hide()
+                    self.gop_warning = warning
+                    self.layout.addWidget(warning)
             self.layout.addStretch()
 
         self.edits_by_name["buffer_size"].setDisabled(options.buffer_mode != 1)
         self.edits_by_name["buffer_memory"].setDisabled(options.buffer_mode != 2)
-        opts = options
-        self.edits_by_name["preload_radius"].setDisabled(not opts.bidirectional_preloading)
-        self.edits_by_name["preload_default_gop"].setDisabled(not opts.bidirectional_preloading)
+        self._update_preload_widgets()
 
     def updateEditField(self, edit: QtWidgets.QWidget, value: Any, option: Option) -> None:
         print(option.value_type, value, edit)
         edit.setValue(value)
         edit.current_value = value
+
+    def _update_preload_widgets(self) -> None:
+        opts = self.data_file.getOptionAccess()
+        on = self.edits_by_name["bidirectional_preloading"].current_value
+        if on is None:
+            on = opts.bidirectional_preloading
+        mode = self.edits_by_name["preload_mode"].current_value
+        if mode is None:
+            mode = opts.preload_mode
+        has_gop = self.data_file.has_gop_info()
+        self.edits_by_name["preload_mode"].setDisabled(not on)
+        self.edits_by_name["preload_gops"].setDisabled(not (on and mode == 0 and has_gop))
+        self.edits_by_name["preload_frame_buffer"].setDisabled(not (on and mode == 1))
+        self.edits_by_name["preload_batch_size"].setDisabled(not (on and mode == 1))
+        if hasattr(self, "gop_warning"):
+            self.gop_warning.setVisible(on and mode == 0 and not has_gop)
 
     def list_selected(self) -> None:
         pass
@@ -472,10 +492,8 @@ class OptionEditorWindow(QtWidgets.QWidget):
         if option.key == "buffer_mode":
             self.edits_by_name["buffer_size"].setDisabled(value != 1)
             self.edits_by_name["buffer_memory"].setDisabled(value != 2)
-        if option.key == "bidirectional_preloading":
-            # toggle related fields
-            self.edits_by_name["preload_radius"].setDisabled(not value)
-            self.edits_by_name["preload_default_gop"].setDisabled(not value)
+        if option.key in {"bidirectional_preloading", "preload_mode"}:
+            self._update_preload_widgets()
         field.current_value = value
         self.button_apply.setDisabled(False)
 

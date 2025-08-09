@@ -274,6 +274,11 @@ class DataFileExtended(DataFile):
 
         self.signals = DataFileSignals()
 
+        # thread pool used to buffer frames in the background so that
+        # preloading does not block the GUI thread
+        self.preload_pool = QtCore.QThreadPool()
+        self.preload_pool.setMaxThreadCount(1)  # one worker is enough
+
     def optionsChanged(self, key: None = None) -> None:
         self.buffer.setBufferCount(self.getOption("buffer_size"), self.getOption("buffer_memory"),
                                    self.getOption("buffer_mode"))
@@ -848,6 +853,19 @@ class DataFileExtended(DataFile):
             slots, slot_index = self.buffer.prepare_slot(idx, layer)
             self.buffer_frame(image_obj, image_obj.get_full_filename(), slots, slot_index, idx, layer=layer)
 
+    class _PreloadTask(QtCore.QRunnable):
+        """Worker that preloads frames without blocking the main thread."""
+
+        def __init__(self, datafile, frames, layer):
+            super().__init__()
+            # materialize indices so they can be reused inside the worker
+            self.datafile = datafile
+            self.frames = list(frames)
+            self.layer = layer
+
+        def run(self):
+            self.datafile.ensure_frames_buffered(self.frames, self.layer)
+
     def _is_video_image(self, image_obj) -> bool:
         fn = image_obj.filename.lower()
         return fn.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm"))
@@ -899,42 +917,116 @@ class DataFileExtended(DataFile):
             end = min(start + gop_size - 1, self.get_image_count() - 1)
             return start, end
 
-    def preload_bidirectional(self, center: int, layer, n: int, default_gop: int):
-        """Preload +/- n frames for images, or whole GOPs for videos."""
+    def has_gop_info(self, image_obj=None) -> bool:
+        """Return True if we detected GOP/keyframe information for the image."""
+        try:
+            if image_obj is None:
+                if self.current_image_index is None or self.current_layer is None:
+                    return False
+                image_obj = self.table_image.get(sort_index=self.current_image_index, layer_id=self.current_layer.id)
+            fn = image_obj.get_full_filename()
+            cache = getattr(self, "_gop_cache", {}).get(fn)
+            if cache is None:
+                # trigger cache generation
+                self._get_gop_bounds(0, image_obj, 0)
+                cache = self._gop_cache.get(fn)
+            return bool(cache.get("keys"))
+        except Exception:
+            return False
+
+    def preload_bidirectional(self, center: int, layer, mode: int, gop_count: int,
+                              frame_buffer: int, batch_size: int):
+        """Preload frames around ``center`` according to the selected mode.
+
+        Parameters
+        ----------
+        center: int
+            Current frame index.
+        layer: Layer
+            Active layer.
+        mode: int
+            ``0`` for video mode, ``1`` for image mode.
+        gop_count: int
+            Number of GOPs to preload before and after in video mode.
+        frame_buffer: int
+            How many frames to keep buffered on each side in image mode.
+        batch_size: int
+            Number of frames to load in one go when the buffer window is
+            extended in image mode.
+        """
         if center is None:
             return
-        # get current image object
-        img = self.table_image.get(sort_index=center, layer_id=layer.id)
 
-        if self._is_video_image(img):
-            # preload previous, current, next GOPs around center (enough to cover +/- n)
-            cur_start, cur_end = self._get_gop_bounds(center, img, default_gop)
-            ranges = [(cur_start, cur_end)]
+        if mode == 0:
+            # video mode: preload whole GOPs
+            img = self.table_image.get(sort_index=center, layer_id=layer.id)
+            if not (self._is_video_image(img) and self.has_gop_info(img)):
+                return
+            ranges = []
+            start, end = self._get_gop_bounds(center, img, 0)
+            ranges.append((start, end))
 
-            # previous needed?
-            if center - n < cur_start:
-                prev_start = max(cur_start - default_gop, 0)
-                # if we have keys, recompute
-                ps, pe = self._get_gop_bounds(prev_start, img, default_gop)
+            # walk backwards and forwards across video boundaries
+            prev_end = start - 1
+            for _ in range(gop_count):
+                if prev_end < 0:
+                    break
+                prev_img = self.table_image.get(sort_index=prev_end, layer_id=layer.id)
+                ps, pe = self._get_gop_bounds(prev_end, prev_img, 0)
                 ranges.append((ps, pe))
+                prev_end = ps - 1
 
-            # next needed?
-            if center + n > cur_end:
-                ns = cur_end + 1
-                if ns < self.get_image_count():
-                    ns, ne = self._get_gop_bounds(ns, img, default_gop)
-                    ranges.append((ns, ne))
+            next_start = end + 1
+            total = self.get_image_count()
+            for _ in range(gop_count):
+                if next_start >= total:
+                    break
+                next_img = self.table_image.get(sort_index=next_start, layer_id=layer.id)
+                ns, ne = self._get_gop_bounds(next_start, next_img, 0)
+                ranges.append((ns, ne))
+                next_start = ne + 1
 
             frames = []
             for s, e in ranges:
                 frames.extend(range(s, e + 1))
-        else:
-            # still images
-            start = max(center - n, 0)
-            end = min(center + n, self.get_image_count() - 1)
-            frames = range(start, end + 1)
 
-        self.ensure_frames_buffered(frames, layer)
+            keep = set(frames)
+            for num, lid in list(self.buffer.indices):
+                if lid == layer.id and num is not None and num not in keep:
+                    self.buffer.remove_frame(num, layer)
+
+        else:
+            # image mode: maintain sliding window of frames
+            total = self.get_image_count()
+            half = frame_buffer
+            start = max(center - half, 0)
+            end = min(center + half, total - 1)
+
+            rng = getattr(self, "_img_preload_range", (start, end))
+            cur_start, cur_end = rng
+            if center < cur_start or center > cur_end:
+                cur_start, cur_end = start, end
+
+            threshold = half - batch_size
+            if center - cur_start < threshold and cur_start > 0:
+                ns = max(cur_start - batch_size, 0)
+                self.ensure_frames_buffered(range(ns, cur_start), layer)
+                cur_start = ns
+            if cur_end - center < threshold and cur_end < total - 1:
+                ne = min(cur_end + batch_size, total - 1)
+                self.ensure_frames_buffered(range(cur_end + 1, ne + 1), layer)
+                cur_end = ne
+
+            self._img_preload_range = (cur_start, cur_end)
+            frames = range(cur_start, cur_end + 1)
+            keep = set(frames)
+            for num, lid in list(self.buffer.indices):
+                if lid == layer.id and num is not None and (num < cur_start or num > cur_end):
+                    self.buffer.remove_frame(num, layer)
+
+        # schedule buffering in a background worker to avoid blocking the UI
+        task = self._PreloadTask(self, frames, layer)
+        self.preload_pool.start(task)
 
 
 class FrameBuffer:
@@ -993,7 +1085,10 @@ class FrameBuffer:
             index = self.last_index + 1
             # estimate memory need for next image
             if images and memory + memory / images - self.getMemoryOfSlot(index) > self.buffer_memory * 1e6:
-                index = 0
+                # once the memory limit is reached reuse the slots in a circular
+                # fashion instead of sticking to slot 0 which would keep the
+                # previously allocated images alive indefinitely
+                index = (self.last_index + 1) % len(self.slots) if self.slots else 0
             self.last_index = index
         elif self.buffer_mode == 1:
             index = (self.last_index + 1) % self.buffer_count
