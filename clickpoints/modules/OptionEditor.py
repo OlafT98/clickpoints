@@ -301,19 +301,20 @@ class OptionEditorWindow(QtWidgets.QWidget):
                 if option.hidden:
                     continue
                 edit = getOptionInputWidget(option, self.layout)
-                edit.valueChanged.connect(lambda value, edit=edit, option=option: self.Changed(edit, value, option))
+                if option.key in {"bidirectional_preloading", "preload_mode"}:
+                    edit.valueChanged.connect(
+                        lambda value, edit=edit, option=option: self._preload_option_changed(edit, value, option)
+                    )
+                else:
+                    edit.valueChanged.connect(
+                        lambda value, edit=edit, option=option: self.Changed(edit, value, option)
+                    )
                 edit.current_value = None
                 edit.option = option
                 edit.error = None
                 edit.has_error = False
                 self.edits.append(edit)
                 self.edits_by_name[option.key] = edit
-                if option.key == "preload_gops":
-                    warning = QtWidgets.QLabel("Warning, GOP couldn't be detected, use image mode instead")
-                    warning.setStyleSheet("color: orange")
-                    warning.hide()
-                    self.gop_warning = warning
-                    self.layout.addWidget(warning)
             self.layout.addStretch()
 
         self.edits_by_name["buffer_size"].setDisabled(options.buffer_mode != 1)
@@ -330,16 +331,20 @@ class OptionEditorWindow(QtWidgets.QWidget):
         on = self.edits_by_name["bidirectional_preloading"].current_value
         if on is None:
             on = opts.bidirectional_preloading
-        mode = self.edits_by_name["preload_mode"].current_value
+        mode_edit = self.edits_by_name["preload_mode"]
+        mode = mode_edit.current_value
         if mode is None:
             mode = opts.preload_mode
-        has_gop = self.data_file.has_gop_info()
+            if on:
+                default = 0 if self.data_file.is_video() else 1
+                mode_edit.setValue(default)
+                mode_edit.current_value = default
+                mode = default
         self.edits_by_name["preload_mode"].setDisabled(not on)
-        self.edits_by_name["preload_gops"].setDisabled(not (on and mode == 0 and has_gop))
+        self.edits_by_name["preload_gops"].setDisabled(not (on and mode == 0))
+        self.edits_by_name["preload_gop_size"].setDisabled(not (on and mode == 0))
         self.edits_by_name["preload_frame_buffer"].setDisabled(not (on and mode == 1))
         self.edits_by_name["preload_batch_size"].setDisabled(not (on and mode == 1))
-        if hasattr(self, "gop_warning"):
-            self.gop_warning.setVisible(on and mode == 0 and not has_gop)
 
     def list_selected(self) -> None:
         pass
@@ -492,10 +497,12 @@ class OptionEditorWindow(QtWidgets.QWidget):
         if option.key == "buffer_mode":
             self.edits_by_name["buffer_size"].setDisabled(value != 1)
             self.edits_by_name["buffer_memory"].setDisabled(value != 2)
-        if option.key in {"bidirectional_preloading", "preload_mode"}:
-            self._update_preload_widgets()
         field.current_value = value
         self.button_apply.setDisabled(False)
+
+    def _preload_option_changed(self, field: QtWidgets.QWidget, value: Any, option: Option) -> None:
+        self.Changed(field, value, option)
+        self._update_preload_widgets()
 
     def Apply(self) -> bool:
         for edit in self.edits:
@@ -511,6 +518,7 @@ class OptionEditorWindow(QtWidgets.QWidget):
         self.data_file.optionsChanged(None)
         BroadCastEvent(self.window.modules, "optionsChanged", None)
         self.window.JumpFrames(0)
+        self._update_preload_widgets()
         return True
 
     def Ok(self) -> None:

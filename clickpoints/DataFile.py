@@ -1630,6 +1630,14 @@ class DataFile:
             tooltip="Number of GOPs to preload before and after the current one in video mode.",
         )
         self._AddOption(
+            key="preload_gop_size",
+            display_name="GOP Size",
+            default=30,
+            value_type="int",
+            min_value=1,
+            tooltip="Frames per GOP for video preloading. Performance improves drastically if this matches the actual GOP size. Multiple videos with different GOP sizes are not yet supported.",
+        )
+        self._AddOption(
             key="preload_frame_buffer",
             display_name="Buffered Frames",
             default=70,

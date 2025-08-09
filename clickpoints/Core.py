@@ -380,13 +380,14 @@ class ClickPointsWindow(QtWidgets.QWidget):
         if opts.bidirectional_preloading:
             mode = opts.preload_mode
             gops = opts.preload_gops
+            gop_size = opts.preload_gop_size
             frame_buf = opts.preload_frame_buffer
             batch = opts.preload_batch_size
             # schedule quickly so UI isn't blocked
             QtCore.QTimer.singleShot(
                 0,
-                lambda m=mode, g=gops, f=frame_buf, b=batch, idx=target_id, layer=layer_id:
-                    self.data_file.preload_bidirectional(idx, layer, m, g, f, b)
+                lambda m=mode, g=gops, s=gop_size, f=frame_buf, b=batch, idx=target_id, layer=layer_id:
+                    self.data_file.preload_bidirectional(idx, layer, m, g, s, f, b)
             )
 
 

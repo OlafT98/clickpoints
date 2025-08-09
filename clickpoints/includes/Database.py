@@ -870,72 +870,25 @@ class DataFileExtended(DataFile):
         fn = image_obj.filename.lower()
         return fn.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm"))
 
-    def _get_gop_bounds(self, frame_index: int, image_obj, default_gop: int) -> Tuple[int, int]:
-        """
-        Return (start, end) indices (inclusive) of the GOP containing frame_index.
-        Try to detect keyframes via imageio metadata; fallback to default_gop.
-        """
-        # simple cache on the DataFileExtended instance
-        if not hasattr(self, "_gop_cache"):
-            self._gop_cache = {}  # {filename: {"keys":[...], "gop_size":int}}
+    def _get_gop_bounds(self, frame_index: int, gop_size: int) -> Tuple[int, int]:
+        """Return (start, end) indices of the GOP containing ``frame_index``."""
+        start = (frame_index // gop_size) * gop_size
+        end = min(start + gop_size - 1, self.get_image_count() - 1)
+        return start, end
 
-        fn = image_obj.get_full_filename()
-        cache = self._gop_cache.get(fn)
-        if cache is None:
-            keys = []
-            gop_size = default_gop
-            try:
-                rdr = imageio.get_reader(fn)
-                md = rdr.get_meta_data()
-                # some backends expose 'key_frames'
-                keys = md.get("key_frames", []) or md.get("keyframes", [])
-                if not keys and "codec" in md:
-                    # no real data; keep default
-                    pass
-                if keys:
-                    # derive variable GOP, but we still preload full blocks around current
-                    pass
-            except Exception:
-                pass
-            cache = {"keys": keys, "gop_size": gop_size}
-            self._gop_cache[fn] = cache
-
-        keys = cache["keys"]
-        gop_size = cache["gop_size"]
-
-        if keys:
-            # find last key <= frame_index
-            import bisect
-            i = bisect.bisect_right(keys, frame_index) - 1
-            start = keys[i] if i >= 0 else 0
-            # next key - 1 or end of video
-            end = keys[i + 1] - 1 if i + 1 < len(keys) else self.get_image_count() - 1
-            return start, end
-        else:
-            # fixed-size GOP fallback
-            start = (frame_index // gop_size) * gop_size
-            end = min(start + gop_size - 1, self.get_image_count() - 1)
-            return start, end
-
-    def has_gop_info(self, image_obj=None) -> bool:
-        """Return True if we detected GOP/keyframe information for the image."""
+    def is_video(self, image_obj=None) -> bool:
+        """Return True if the underlying data source is a video."""
         try:
             if image_obj is None:
                 if self.current_image_index is None or self.current_layer is None:
                     return False
                 image_obj = self.table_image.get(sort_index=self.current_image_index, layer_id=self.current_layer.id)
-            fn = image_obj.get_full_filename()
-            cache = getattr(self, "_gop_cache", {}).get(fn)
-            if cache is None:
-                # trigger cache generation
-                self._get_gop_bounds(0, image_obj, 0)
-                cache = self._gop_cache.get(fn)
-            return bool(cache.get("keys"))
+            return self._is_video_image(image_obj)
         except Exception:
             return False
 
     def preload_bidirectional(self, center: int, layer, mode: int, gop_count: int,
-                              frame_buffer: int, batch_size: int):
+                              gop_size: int, frame_buffer: int, batch_size: int):
         """Preload frames around ``center`` according to the selected mode.
 
         Parameters
@@ -960,10 +913,10 @@ class DataFileExtended(DataFile):
         if mode == 0:
             # video mode: preload whole GOPs
             img = self.table_image.get(sort_index=center, layer_id=layer.id)
-            if not (self._is_video_image(img) and self.has_gop_info(img)):
+            if not self._is_video_image(img):
                 return
             ranges = []
-            start, end = self._get_gop_bounds(center, img, 0)
+            start, end = self._get_gop_bounds(center, gop_size)
             ranges.append((start, end))
 
             # walk backwards and forwards across video boundaries
@@ -971,8 +924,7 @@ class DataFileExtended(DataFile):
             for _ in range(gop_count):
                 if prev_end < 0:
                     break
-                prev_img = self.table_image.get(sort_index=prev_end, layer_id=layer.id)
-                ps, pe = self._get_gop_bounds(prev_end, prev_img, 0)
+                ps, pe = self._get_gop_bounds(prev_end, gop_size)
                 ranges.append((ps, pe))
                 prev_end = ps - 1
 
@@ -981,8 +933,7 @@ class DataFileExtended(DataFile):
             for _ in range(gop_count):
                 if next_start >= total:
                     break
-                next_img = self.table_image.get(sort_index=next_start, layer_id=layer.id)
-                ns, ne = self._get_gop_bounds(next_start, next_img, 0)
+                ns, ne = self._get_gop_bounds(next_start, gop_size)
                 ranges.append((ns, ne))
                 next_start = ne + 1
 
