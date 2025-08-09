@@ -892,6 +892,34 @@ class DataFileExtended(DataFile):
                 if not keys and "codec" in md:
                     # no real data; keep default
                     pass
+                if not keys:
+                    # try to use ffprobe to gather keyframe information
+                    import subprocess, json
+                    try:
+                        cmd = [
+                            "ffprobe",
+                            "-v",
+                            "error",
+                            "-select_streams",
+                            "v:0",
+                            "-show_entries",
+                            "frame=pict_type",
+                            "-of",
+                            "json",
+                            fn,
+                        ]
+                        result = subprocess.run(
+                            cmd, capture_output=True, text=True, check=True
+                        )
+                        data = json.loads(result.stdout)
+                        frames = data.get("frames", [])
+                        for i, fr in enumerate(frames):
+                            if fr.get("pict_type") == "I":
+                                keys.append(i)
+                        if len(keys) >= 2:
+                            gop_size = min(b - a for a, b in zip(keys, keys[1:]))
+                    except Exception:
+                        pass
                 if keys:
                     # derive variable GOP, but we still preload full blocks around current
                     pass

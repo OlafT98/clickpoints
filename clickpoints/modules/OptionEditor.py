@@ -301,7 +301,14 @@ class OptionEditorWindow(QtWidgets.QWidget):
                 if option.hidden:
                     continue
                 edit = getOptionInputWidget(option, self.layout)
-                edit.valueChanged.connect(lambda value, edit=edit, option=option: self.Changed(edit, value, option))
+                if option.key in {"bidirectional_preloading", "preload_mode"}:
+                    edit.valueChanged.connect(
+                        lambda value, edit=edit, option=option: self._preload_option_changed(edit, value, option)
+                    )
+                else:
+                    edit.valueChanged.connect(
+                        lambda value, edit=edit, option=option: self.Changed(edit, value, option)
+                    )
                 edit.current_value = None
                 edit.option = option
                 edit.error = None
@@ -492,10 +499,12 @@ class OptionEditorWindow(QtWidgets.QWidget):
         if option.key == "buffer_mode":
             self.edits_by_name["buffer_size"].setDisabled(value != 1)
             self.edits_by_name["buffer_memory"].setDisabled(value != 2)
-        if option.key in {"bidirectional_preloading", "preload_mode"}:
-            self._update_preload_widgets()
         field.current_value = value
         self.button_apply.setDisabled(False)
+
+    def _preload_option_changed(self, field: QtWidgets.QWidget, value: Any, option: Option) -> None:
+        self.Changed(field, value, option)
+        self._update_preload_widgets()
 
     def Apply(self) -> bool:
         for edit in self.edits:
@@ -511,6 +520,7 @@ class OptionEditorWindow(QtWidgets.QWidget):
         self.data_file.optionsChanged(None)
         BroadCastEvent(self.window.modules, "optionsChanged", None)
         self.window.JumpFrames(0)
+        self._update_preload_widgets()
         return True
 
     def Ok(self) -> None:
