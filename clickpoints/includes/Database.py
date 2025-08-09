@@ -34,6 +34,8 @@ import numpy as np
 import peewee
 from qtpy import QtCore
 from qtpy import QtGui
+import concurrent.futures
+import threading
 
 from clickpoints.DataFile import DataFile
 from clickpoints.includes.ConfigLoad import dotdict
@@ -264,6 +266,8 @@ class DataFileExtended(DataFile):
                                   self.getOption("buffer_mode"))
         self._buffer = self.buffer
         self.thread = None
+        self._preload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._buffer_lock = threading.Lock()
 
         self.last_added_timestamp = -1
         self.timestamp_thread = None
@@ -486,67 +490,80 @@ class DataFileExtended(DataFile):
         # prepare a slot in the buffer
         slots, slot_index, = self.buffer.prepare_slot(index, layer)
         # call buffer_frame in a separate thread or directly
-        frame = self.buffer_frame(image, filename, slots, slot_index, index, layer=layer)
+        frame = self.buffer_frame(image, filename, slots, slot_index, index, layer=layer, threaded=False)
         return frame
 
-    def buffer_frame(self, image: "Image", filename: str, slots: list, slot_index: int, index: int, layer: int = 1,
-                     signal: bool = True, threaded: bool = True):
-        # if we have already a reader...
-        if self.reader is not None:
-            # ... check if it is the right one, if not delete it
-            if filename != self.reader.filename:
-                del self.reader
+    def buffer_frame(
+        self,
+        image: "Image",
+        filename: str,
+        slots: list,
+        slot_index: int,
+        index: int,
+        layer: int = 1,
+        signal: bool = True,
+        threaded: bool = False,
+    ):
+        reader = None
+        if not threaded:
+            reader = self.reader
+            if reader is not None and filename != reader.filename:
+                del reader
                 self.reader = None
-        # if we don't have a reader, create a new one
-        if self.reader is None:
+                reader = None
+        if reader is None:
             if openslide_loaded:
-                # import openslide
                 try:
-                    self.reader = openslide.OpenSlide(filename)
-                    self.reader.filename = filename
-                    self.reader.shape = (self.reader.dimensions[1], self.reader.dimensions[0], 4)
+                    reader = openslide.OpenSlide(filename)
+                    reader.filename = filename
+                    reader.shape = (reader.dimensions[1], reader.dimensions[0], 4)
 
                     def raiseValueError(i):
                         raise ValueError
 
-                    self.reader.get_data = raiseValueError
-                    self.reader.is_slide = True
+                    reader.get_data = raiseValueError
+                    reader.is_slide = True
                 except openslide.lowlevel.OpenSlideUnsupportedFormatError:
-                    pass
-            if self.reader is None:
+                    reader = None
+            if reader is None:
                 try:
-                    self.reader = imageio.get_reader(filename)
-                    self.reader.filename = filename
-                    self.reader.is_slide = False
+                    reader = imageio.get_reader(filename)
+                    reader.filename = filename
+                    reader.is_slide = False
                 except (IOError, ValueError, SyntaxError):
-                    pass
-        # get the data from the reader
+                    reader = None
         image_data = None
-        if self.reader is not None:
+        if reader is not None:
             try:
-                image_data = self.reader.get_data(image.frame)
+                image_data = reader.get_data(image.frame)
             except ValueError:
                 pass
 
             if image_data is not None:
-                # FIX: tifffile now returns float instead of int
                 if np.issubdtype(image_data.dtype, np.floating):
                     if image_data.max() < 2 ** 8:
                         image_data = image_data.astype('uint8')
                     else:
-                        image_data = image_data.astpye('uint16')
-        # if the image can't be opened, open a black image instead
+                        image_data = image_data.astype('uint16')
         if image_data is None:
             width = image.width if image.width is not None else 640
             height = image.height if image.height is not None else 480
             image_data = np.zeros((height, width), dtype=np.uint8)
 
-        if self.reader is not None and self.reader.is_slide:
-            image_data = self.reader
+        if reader is not None and getattr(reader, "is_slide", False):
+            image_data = reader
 
-        # store data in the slot
         if slots is not None:
             slots[slot_index] = image_data
+
+        if threaded:
+            if reader is not None:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+        else:
+            self.reader = reader
 
         return image_data
 
@@ -566,7 +583,7 @@ class DataFileExtended(DataFile):
             return buffer
         filename = os.path.join(image.path.path, image.filename)
         slots, slot_index, = self.buffer.prepare_slot(index, layer)
-        self.buffer_frame(image, filename, slots, slot_index, index, layer, signal=False)
+        self.buffer_frame(image, filename, slots, slot_index, index, layer, signal=False, threaded=False)
         if self.reader.is_slide:
             return self.reader
         return self.buffer.get_frame(index, layer)
@@ -607,6 +624,7 @@ class DataFileExtended(DataFile):
         # join the thread on closing
         if self.thread:
             self.thread.join()
+        self._preload_executor.shutdown(wait=False)
         # remove temporary database if there is still one
         if self.temporary_db:
             self.db.close()
@@ -837,16 +855,34 @@ class DataFileExtended(DataFile):
                 return None
                 
         
+    def _load_frame_to_buffer(self, idx: int, layer) -> None:
+        if idx < 0 or idx >= self.get_image_count():
+            return
+        if self.buffer.get_frame(idx, layer) is not None:
+            return
+        image_obj = self.table_image.get(sort_index=idx, layer_id=layer.id)
+        with self._buffer_lock:
+            slots, slot_index = self.buffer.prepare_slot(idx, layer)
+        data = self.buffer_frame(
+            image_obj,
+            image_obj.get_full_filename(),
+            None,
+            None,
+            idx,
+            layer=layer,
+            threaded=True,
+        )
+        with self._buffer_lock:
+            slot = self.buffer.get_slot_index(idx, layer)
+            if slot is not None:
+                self.buffer.slots[slot] = data
+
     def ensure_frames_buffered(self, indices: Iterable[int], layer):
-        """Load frames into buffer if missing (ignores normal buffer limits)."""
+        """Load frames into buffer if missing asynchronously."""
         for idx in indices:
-            if idx < 0 or idx >= self.get_image_count():
-                continue
             if self.buffer.get_frame(idx, layer) is not None:
                 continue
-            image_obj = self.table_image.get(sort_index=idx, layer_id=layer.id)
-            slots, slot_index = self.buffer.prepare_slot(idx, layer)
-            self.buffer_frame(image_obj, image_obj.get_full_filename(), slots, slot_index, idx, layer=layer)
+            self._preload_executor.submit(self._load_frame_to_buffer, idx, layer)
 
     def _is_video_image(self, image_obj) -> bool:
         fn = image_obj.filename.lower()
