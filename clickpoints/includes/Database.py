@@ -274,6 +274,11 @@ class DataFileExtended(DataFile):
 
         self.signals = DataFileSignals()
 
+        # thread pool used to buffer frames in the background so that
+        # preloading does not block the GUI thread
+        self.preload_pool = QtCore.QThreadPool()
+        self.preload_pool.setMaxThreadCount(1)  # one worker is enough
+
     def optionsChanged(self, key: None = None) -> None:
         self.buffer.setBufferCount(self.getOption("buffer_size"), self.getOption("buffer_memory"),
                                    self.getOption("buffer_mode"))
@@ -848,6 +853,19 @@ class DataFileExtended(DataFile):
             slots, slot_index = self.buffer.prepare_slot(idx, layer)
             self.buffer_frame(image_obj, image_obj.get_full_filename(), slots, slot_index, idx, layer=layer)
 
+    class _PreloadTask(QtCore.QRunnable):
+        """Worker that preloads frames without blocking the main thread."""
+
+        def __init__(self, datafile, frames, layer):
+            super().__init__()
+            # materialize indices so they can be reused inside the worker
+            self.datafile = datafile
+            self.frames = list(frames)
+            self.layer = layer
+
+        def run(self):
+            self.datafile.ensure_frames_buffered(self.frames, self.layer)
+
     def _is_video_image(self, image_obj) -> bool:
         fn = image_obj.filename.lower()
         return fn.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm"))
@@ -933,8 +951,9 @@ class DataFileExtended(DataFile):
             start = max(center - n, 0)
             end = min(center + n, self.get_image_count() - 1)
             frames = range(start, end + 1)
-
-        self.ensure_frames_buffered(frames, layer)
+        # schedule buffering in a background worker to avoid blocking the UI
+        task = self._PreloadTask(self, frames, layer)
+        self.preload_pool.start(task)
 
 
 class FrameBuffer:
