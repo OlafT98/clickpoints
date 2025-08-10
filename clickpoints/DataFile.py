@@ -1614,20 +1614,28 @@ class DataFile:
                     "For videos, whole GOPs around the current frame are preloaded."
         )
         self._AddOption(
+            key="preload_mode",
+            display_name="Preload mode",
+            default=0,
+            value_type="choice",
+            values=["Image", "Video"],
+            tooltip="Select whether preloading is done by frames (image) or by GOPs (video)."
+        )
+        self._AddOption(
             key="preload_radius",
             display_name="Preload radius (frames)",
             default=30,
             value_type="int",
             min_value=1,
-            tooltip="How many frames to preload on each side when bidirectional preloading is enabled."
+            tooltip="How many frames to preload on each side when bidirectional preloading is enabled in image mode."
         )
         self._AddOption(
-            key="preload_default_gop",
-            display_name="Default GOP size (video)",
-            default=60,
+            key="preload_gop_count",
+            display_name="Preload radius (GOPs)",
+            default=1,
             value_type="int",
             min_value=1,
-            tooltip="Fallback GOP size if it cannot be detected from the video file."
+            tooltip="How many GOPs to preload on each side when bidirectional preloading is enabled in video mode."
         )
 
 	
