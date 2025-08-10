@@ -34,6 +34,74 @@ import numpy as np
 import peewee
 from qtpy import QtCore
 from qtpy import QtGui
+import json
+import subprocess
+import shlex
+from fractions import Fraction
+
+
+def _probe_stream_fps_and_duration(path: str) -> Tuple[float, Optional[float]]:
+    cmd = (
+        f'ffprobe -v error -select_streams v:0 -show_streams -show_format -of json {shlex.quote(path)}'
+    )
+    data = json.loads(subprocess.check_output(cmd, shell=True, text=True))
+    st = data["streams"][0]
+    afr = st.get("avg_frame_rate", "0/1")
+    num, den = (int(x) for x in afr.split("/"))
+    fps = float(Fraction(num, den)) if den else 0.0
+    dur = None
+    if "format" in data and "duration" in data["format"]:
+        try:
+            dur = float(data["format"]["duration"])
+        except Exception:
+            pass
+    return fps, dur
+
+
+def _first_two_keyframe_times_adaptive(
+    path: str, start_window_s: float = 2.0, max_window_s: float = 120.0
+) -> List[float]:
+    fps, dur = _probe_stream_fps_and_duration(path)
+    t = start_window_s
+    while True:
+        if dur is not None:
+            t = min(t, dur)
+        cmd = (
+            f'ffprobe -v error -skip_frame nokey -select_streams v:0 -show_frames '
+            f'-show_entries frame=pkt_dts_time,pkt_pts_time,best_effort_timestamp_time '
+            f'-read_intervals 0%+{t} -of json {shlex.quote(path)}'
+        )
+        data = json.loads(subprocess.check_output(cmd, shell=True, text=True))
+        times = []
+        for f in data.get("frames", []):
+            for k in (
+                "pkt_dts_time",
+                "pkt_pts_time",
+                "best_effort_timestamp_time",
+            ):
+                v = f.get(k)
+                if v not in (None, "N/A"):
+                    times.append(float(v))
+                    break
+            if len(times) >= 2:
+                break
+        if len(times) >= 2 or (dur is not None and t >= dur) or t >= max_window_s:
+            return times
+        t *= 2
+
+
+def _probe_const_gop(path: str) -> Tuple[float, int, float]:
+    fps, dur = _probe_stream_fps_and_duration(path)
+    if fps <= 0:
+        fps = 30.0
+    kft = _first_two_keyframe_times_adaptive(path)
+    if len(kft) >= 2:
+        gop_dur = max(0.0, kft[1] - kft[0])
+        gop_len = (
+            max(1, int(round(gop_dur * fps))) if gop_dur > 0 else max(1, int(round(fps)))
+        )
+        return fps, gop_len, kft[0]
+    return fps, max(1, int(round(fps))), (kft[0] if kft else 0.0)
 
 from clickpoints.DataFile import DataFile
 from clickpoints.includes.ConfigLoad import dotdict
@@ -148,9 +216,20 @@ def SQLMemoryDBFromFile(filename: str, *args, **kwargs):
         tempfile.write('%s\n' % line)
     tempfile.seek(0)
 
-    db_memory = peewee.SqliteDatabase(":memory:", *args, **kwargs)
-    db_memory.connection().cursor().executescript(tempfile.read())
-    db_memory.connection().commit()
+    import uuid
+    memory_name = f"file:{uuid.uuid4().hex}?mode=memory&cache=shared"
+    # allow access from multiple threads and keep one connection open so that
+    # the in-memory database persists even if additional connections are
+    # opened and closed by worker threads
+    db_memory = peewee.SqliteDatabase(
+        memory_name, uri=True, check_same_thread=False, *args, **kwargs
+    )
+    keepalive = db_memory.connect()
+    keepalive.cursor().executescript(tempfile.read())
+    keepalive.commit()
+    db_file.close()
+    # keep a reference to the connection so it is not garbage collected
+    db_memory._keepalive = keepalive
     return db_memory
 
 
@@ -849,9 +928,23 @@ class DataFileExtended(DataFile):
                 continue
             if self.buffer.get_frame(idx, layer) is not None:
                 continue
-            image_obj = self.table_image.get(sort_index=idx, layer_id=layer.id)
+            try:
+                image_obj = self.table_image.get(sort_index=idx, layer_id=layer.id)
+            except peewee.OperationalError as e:
+                print(f"DB error while fetching frame {idx}: {e}")
+                continue
+            except peewee.DoesNotExist:
+                print(f"Frame {idx} missing in database for layer {layer.id}")
+                continue
             slots, slot_index = self.buffer.prepare_slot(idx, layer)
-            self.buffer_frame(image_obj, image_obj.get_full_filename(), slots, slot_index, idx, layer=layer)
+            self.buffer_frame(
+                image_obj,
+                image_obj.get_full_filename(),
+                slots,
+                slot_index,
+                idx,
+                layer=layer,
+            )
 
     class _PreloadTask(QtCore.QRunnable):
         """Worker that preloads frames without blocking the main thread."""
@@ -864,94 +957,60 @@ class DataFileExtended(DataFile):
             self.layer = layer
 
         def run(self):
-            self.datafile.ensure_frames_buffered(self.frames, self.layer)
+            import traceback
+            try:
+                self.datafile.ensure_frames_buffered(self.frames, self.layer)
+            except Exception:  # pragma: no cover - log unexpected errors
+                traceback.print_exc()
     
     def _is_video_image(self, image_obj) -> bool:
         fn = image_obj.filename.lower()
         return fn.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm"))
-
-    def _get_gop_bounds(self, frame_index: int, image_obj, default_gop: int) -> Tuple[int, int]:
-        """
-        Return (start, end) indices (inclusive) of the GOP containing frame_index.
-        Try to detect keyframes via imageio metadata; fallback to default_gop.
-        """
-        # simple cache on the DataFileExtended instance
+    def _detect_gop_info(self, image_obj):
         if not hasattr(self, "_gop_cache"):
-            self._gop_cache = {}  # {filename: {"keys":[...], "gop_size":int}}
-
+            self._gop_cache = {}
         fn = image_obj.get_full_filename()
-        cache = self._gop_cache.get(fn)
-        if cache is None:
-            keys = []
-            gop_size = default_gop
+        info = self._gop_cache.get(fn)
+        if info is None:
             try:
-                rdr = imageio.get_reader(fn)
-                md = rdr.get_meta_data()
-                # some backends expose 'key_frames'
-                keys = md.get("key_frames", []) or md.get("keyframes", [])
-                if not keys and "codec" in md:
-                    # no real data; keep default
-                    pass
-                if keys:
-                    # derive variable GOP, but we still preload full blocks around current
-                    pass
+                fps, gop_len, first_kf_time = _probe_const_gop(fn)
+                first_kf_frame = int(round(first_kf_time * fps))
+                info = (gop_len, first_kf_frame)
             except Exception:
-                pass
-            cache = {"keys": keys, "gop_size": gop_size}
-            self._gop_cache[fn] = cache
+                info = None
+            self._gop_cache[fn] = info
+        return info
 
-        keys = cache["keys"]
-        gop_size = cache["gop_size"]
-
-        if keys:
-            # find last key <= frame_index
-            import bisect
-            i = bisect.bisect_right(keys, frame_index) - 1
-            start = keys[i] if i >= 0 else 0
-            # next key - 1 or end of video
-            end = keys[i + 1] - 1 if i + 1 < len(keys) else self.get_image_count() - 1
-            return start, end
-        else:
-            # fixed-size GOP fallback
-            start = (frame_index // gop_size) * gop_size
-            end = min(start + gop_size - 1, self.get_image_count() - 1)
-            return start, end
-
-    def preload_bidirectional(self, center: int, layer, n: int, default_gop: int):
-        """Preload +/- n frames for images, or whole GOPs for videos."""
+    def preload_bidirectional(self, center: int, layer, opts):
+        """Preload frames or GOPs around center based on options."""
         if center is None:
             return
-        # get current image object
         img = self.table_image.get(sort_index=center, layer_id=layer.id)
+        total = self.get_image_count()
 
-        if self._is_video_image(img):
-            # preload previous, current, next GOPs around center (enough to cover +/- n)
-            cur_start, cur_end = self._get_gop_bounds(center, img, default_gop)
-            ranges = [(cur_start, cur_end)]
-
-            # previous needed?
-            if center - n < cur_start:
-                prev_start = max(cur_start - default_gop, 0)
-                # if we have keys, recompute
-                ps, pe = self._get_gop_bounds(prev_start, img, default_gop)
-                ranges.append((ps, pe))
-
-            # next needed?
-            if center + n > cur_end:
-                ns = cur_end + 1
-                if ns < self.get_image_count():
-                    ns, ne = self._get_gop_bounds(ns, img, default_gop)
-                    ranges.append((ns, ne))
-
-            frames = []
-            for s, e in ranges:
-                frames.extend(range(s, e + 1))
+        frames: List[int] = []
+        if opts.preload_mode == 1 and self._is_video_image(img):
+            info = self._detect_gop_info(img)
+            if info is not None:
+                gop_len, first_kf = info
+                g = (center - first_kf) // gop_len
+                for offset in range(-opts.preload_gop_count, opts.preload_gop_count + 1):
+                    start = first_kf + (g + offset) * gop_len
+                    if start < 0 or start >= total:
+                        continue
+                    end = min(start + gop_len - 1, total - 1)
+                    frames.extend(range(start, end + 1))
+            else:
+                radius = opts.preload_radius
+                start = max(center - radius, 0)
+                end = min(center + radius, total - 1)
+                frames = range(start, end + 1)
         else:
-            # still images
-            start = max(center - n, 0)
-            end = min(center + n, self.get_image_count() - 1)
+            radius = opts.preload_radius
+            start = max(center - radius, 0)
+            end = min(center + radius, total - 1)
             frames = range(start, end + 1)
-        # schedule buffering in a background worker to avoid blocking the UI
+
         task = self._PreloadTask(self, frames, layer)
         self.preload_pool.start(task)
 
