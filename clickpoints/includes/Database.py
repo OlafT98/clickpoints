@@ -148,7 +148,10 @@ def SQLMemoryDBFromFile(filename: str, *args, **kwargs):
         tempfile.write('%s\n' % line)
     tempfile.seek(0)
 
-    db_memory = peewee.SqliteDatabase(":memory:", *args, **kwargs)
+    import uuid
+    memory_name = f"file:{uuid.uuid4().hex}?mode=memory&cache=shared"
+    db_memory = peewee.SqliteDatabase(memory_name, uri=True, *args, **kwargs)
+    db_memory.connect()
     db_memory.connection().cursor().executescript(tempfile.read())
     db_memory.connection().commit()
     return db_memory
