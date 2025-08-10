@@ -313,8 +313,13 @@ class OptionEditorWindow(QtWidgets.QWidget):
         self.edits_by_name["buffer_size"].setDisabled(options.buffer_mode != 1)
         self.edits_by_name["buffer_memory"].setDisabled(options.buffer_mode != 2)
         opts = options
-        self.edits_by_name["preload_radius"].setDisabled(not opts.bidirectional_preloading)
-        self.edits_by_name["preload_default_gop"].setDisabled(not opts.bidirectional_preloading)
+        self.edits_by_name["preload_mode"].setDisabled(not opts.bidirectional_preloading)
+        self.edits_by_name["preload_radius"].setDisabled(
+            not opts.bidirectional_preloading or opts.preload_mode != 0
+        )
+        self.edits_by_name["preload_gop_count"].setDisabled(
+            not opts.bidirectional_preloading or opts.preload_mode != 1
+        )
 
     def updateEditField(self, edit: QtWidgets.QWidget, value: Any, option: Option) -> None:
         print(option.value_type, value, edit)
@@ -474,8 +479,14 @@ class OptionEditorWindow(QtWidgets.QWidget):
             self.edits_by_name["buffer_memory"].setDisabled(value != 2)
         if option.key == "bidirectional_preloading":
             # toggle related fields
-            self.edits_by_name["preload_radius"].setDisabled(not value)
-            self.edits_by_name["preload_default_gop"].setDisabled(not value)
+            self.edits_by_name["preload_mode"].setDisabled(not value)
+            mode = self.edits_by_name["preload_mode"].value()
+            self.edits_by_name["preload_radius"].setDisabled(not value or mode != 0)
+            self.edits_by_name["preload_gop_count"].setDisabled(not value or mode != 1)
+        if option.key == "preload_mode":
+            bidir = self.edits_by_name["bidirectional_preloading"].value()
+            self.edits_by_name["preload_radius"].setDisabled(not bidir or value != 0)
+            self.edits_by_name["preload_gop_count"].setDisabled(not bidir or value != 1)
         field.current_value = value
         self.button_apply.setDisabled(False)
 

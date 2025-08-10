@@ -21,7 +21,10 @@
 
 import importlib.metadata
 
-__version__ = importlib.metadata.metadata('clickpoints')['version']
+try:
+    __version__ = importlib.metadata.metadata('clickpoints')['version']
+except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+    __version__ = "0.0.0"
 
 # Try to import the addon library, but for only working with the database, we don't need the Addon
 # definition which is based on Qt
