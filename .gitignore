@@ -36,3 +36,4 @@ clickpoints/.idea/
 clickpointsexamples-master
 clickpoints/addons/imageio_plugin/*
 qtdebug.log
+.venv/*

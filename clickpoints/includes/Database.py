@@ -274,6 +274,11 @@ class DataFileExtended(DataFile):
 
         self.signals = DataFileSignals()
 
+        # thread pool used to buffer frames in the background so that
+        # preloading does not block the GUI thread
+        self.preload_pool = QtCore.QThreadPool()
+        self.preload_pool.setMaxThreadCount(1)  # one worker is enough
+
     def optionsChanged(self, key: None = None) -> None:
         self.buffer.setBufferCount(self.getOption("buffer_size"), self.getOption("buffer_memory"),
                                    self.getOption("buffer_mode"))
@@ -848,6 +853,30 @@ class DataFileExtended(DataFile):
             slots, slot_index = self.buffer.prepare_slot(idx, layer)
             self.buffer_frame(image_obj, image_obj.get_full_filename(), slots, slot_index, idx, layer=layer)
 
+    class _PreloadTask(QtCore.QRunnable):
+        """Worker that preloads frames and prunes the buffer in the background."""
+
+        def __init__(self, datafile, frames, layer, keep_indices=None):
+            super().__init__()
+            # materialize indices so they can be reused inside the worker
+            self.datafile = datafile
+            self.frames = list(frames)
+            self.layer = layer
+            self.keep = set(keep_indices or [])
+
+        def run(self):
+            # preload required frames
+            self.datafile.ensure_frames_buffered(self.frames, self.layer)
+            # remove frames outside the keep range to free memory
+            if self.keep:
+                buf = self.datafile.buffer
+                # copy to avoid issues if buffer changes during iteration
+                for number, layer_id in list(buf.indices):
+                    if number is None or layer_id != self.layer.id:
+                        continue
+                    if number not in self.keep:
+                        buf.remove_frame(number, self.layer)
+    
     def _is_video_image(self, image_obj) -> bool:
         fn = image_obj.filename.lower()
         return fn.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm"))
@@ -914,7 +943,6 @@ class DataFileExtended(DataFile):
             # previous needed?
             if center - n < cur_start:
                 prev_start = max(cur_start - default_gop, 0)
-                # if we have keys, recompute
                 ps, pe = self._get_gop_bounds(prev_start, img, default_gop)
                 ranges.append((ps, pe))
 
@@ -932,9 +960,27 @@ class DataFileExtended(DataFile):
             # still images
             start = max(center - n, 0)
             end = min(center + n, self.get_image_count() - 1)
-            frames = range(start, end + 1)
+            frames = list(range(start, end + 1))
 
-        self.ensure_frames_buffered(frames, layer)
+        # determine frames we want to keep in the buffer (preloaded frames plus
+        # some margin on both sides). Keeping more frames than strictly
+        # necessary avoids stuttering when quickly scrubbing through frames.
+        if frames:
+            keep_start = max(min(frames) - n, 0)
+            keep_end = min(max(frames) + n, self.get_image_count() - 1)
+            keep_indices = range(keep_start, keep_end + 1)
+            # make sure the internal buffer can hold the desired amount of frames
+            needed = len(list(keep_indices)) + 5  # little extra margin
+            if self.buffer.buffer_mode != 1 or self.buffer.buffer_count < needed:
+                # switch to frame-count based buffer with sufficient slots
+                self.buffer.setBufferCount(needed, 0, 1)
+        else:
+            keep_indices = []
+
+        # schedule buffering and pruning in a background worker to avoid
+        # blocking the UI
+        task = self._PreloadTask(self, frames, layer, keep_indices)
+        self.preload_pool.start(task)
 
 
 class FrameBuffer:

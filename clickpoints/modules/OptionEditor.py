@@ -310,9 +310,16 @@ class OptionEditorWindow(QtWidgets.QWidget):
                 self.edits_by_name[option.key] = edit
             self.layout.addStretch()
 
-        self.edits_by_name["buffer_size"].setDisabled(options.buffer_mode != 1)
-        self.edits_by_name["buffer_memory"].setDisabled(options.buffer_mode != 2)
         opts = options
+        # If bidirectional preloading is active the buffer is managed
+        # internally and all manual buffer controls should be disabled.
+        self.edits_by_name["buffer_mode"].setDisabled(opts.bidirectional_preloading)
+        self.edits_by_name["buffer_size"].setDisabled(
+            opts.bidirectional_preloading or options.buffer_mode != 1
+        )
+        self.edits_by_name["buffer_memory"].setDisabled(
+            opts.bidirectional_preloading or options.buffer_mode != 2
+        )
         self.edits_by_name["preload_radius"].setDisabled(not opts.bidirectional_preloading)
         self.edits_by_name["preload_default_gop"].setDisabled(not opts.bidirectional_preloading)
 
@@ -470,12 +477,24 @@ class OptionEditorWindow(QtWidgets.QWidget):
                                 "Estimated memory usage:<br/>%s" % PrittyPrintSize(value * self.window.im.nbytes),
                                 width=140, normal_msg=True)
         if option.key == "buffer_mode":
-            self.edits_by_name["buffer_size"].setDisabled(value != 1)
-            self.edits_by_name["buffer_memory"].setDisabled(value != 2)
+            # when bidirectional preloading is inactive, mode determines which
+            # of the size/memory fields is editable
+            self.edits_by_name["buffer_size"].setDisabled(
+                value != 1 or self.edits_by_name["buffer_mode"].isEnabled() is False
+            )
+            self.edits_by_name["buffer_memory"].setDisabled(
+                value != 2 or self.edits_by_name["buffer_mode"].isEnabled() is False
+            )
         if option.key == "bidirectional_preloading":
-            # toggle related fields
+            # toggle related fields and buffer controls
             self.edits_by_name["preload_radius"].setDisabled(not value)
             self.edits_by_name["preload_default_gop"].setDisabled(not value)
+            self.edits_by_name["buffer_mode"].setDisabled(value)
+            mode_val = self.edits_by_name["buffer_mode"].current_value
+            if mode_val is None:
+                mode_val = self.data_file.getOption("buffer_mode")
+            self.edits_by_name["buffer_size"].setDisabled(value or mode_val != 1)
+            self.edits_by_name["buffer_memory"].setDisabled(value or mode_val != 2)
         field.current_value = value
         self.button_apply.setDisabled(False)
 
